@@ -8,6 +8,17 @@
 - 窗口封存后到达的事件标记为 late，仍计入聚合，同时生成一条修正记录，
   窗口的 correction_count 随之递增。
 
+提交预演（dry-run，只读语义）：
+- POST /ingest/preview 接收与 POST /ingest 完全相同的设备与事件批次，在同一数据库快照
+  （BEGIN IMMEDIATE 写锁事务）上按请求顺序推进去重、水位线、封存、迟到修正、告警状态机
+  与组汇总对账，返回逐事件预计 accepted/duplicate/late、预计水位线，以及本批次触及窗口
+  （至少落入一个非重复事件）预演后的 count/sum/status/correction_count。
+- 批内重复 event_id 只计一次；前一事件抬高水位线后，后一旧事件可能因此变成 late；
+  结果口径与随即在无并发写入时真正提交同一批次一致。预演与正式提交共用同一份批次处理
+  逻辑（_run_ingest_batch），避免两套判断漂移。
+- 整个预演事务结束时一律 ROLLBACK：设备（含不存在设备的自动注册）、事件、窗口、修正、
+  告警状态/转换流水、组汇总及不可变审计快照均不留痕。
+
 设备可版本化标签：
 - PUT /devices/{device_id}/labels 以**全量替换**语义写入不超过 20 个 key/value；
   键名在同一 SQLite 写事务内规范化（去首尾空白、小写、^[a-z0-9][a-z0-9_.-]*$），
@@ -145,7 +156,7 @@ async def lifespan(app: FastAPI):
     yield
 
 
-app = FastAPI(title="Sensor Telemetry Aggregation API", version="1.9.0", lifespan=lifespan)
+app = FastAPI(title="Sensor Telemetry Aggregation API", version="1.10.0", lifespan=lifespan)
 
 # 稳健异常检测：基于中位数/MAD 的修正 z 分数，0.6745 为正态分布下 MAD ≈ 0.6745σ 的换算系数
 DEFAULT_ANOMALY_THRESHOLD = 3.5
@@ -183,6 +194,30 @@ class IngestResponse(BaseModel):
     duplicates: int
     late: int
     results: list[EventResult]
+
+
+class PreviewWindowOut(BaseModel):
+    # 预演后本批次触及窗口（至少落入一个非重复事件）的状态
+    window_start: datetime
+    window_end: datetime
+    status: Literal["open", "sealed"]
+    count: int
+    sum: float
+    correction_count: int
+
+
+class IngestPreviewResponse(BaseModel):
+    device_id: str
+    # 预演推进后的预计水位线（设备从无数据、且批次全为重复时保持 null）
+    watermark: Optional[datetime]
+    accepted: int
+    duplicates: int
+    late: int
+    # 逐事件预计结果，顺序与请求一致；判定随批次内顺序推进（前一事件抬高
+    # 水位线后，后一旧事件可能因此成为 late；批内重复 event_id 只计一次）
+    results: list[EventResult]
+    # 本批次触及窗口在预演后的 count/sum/status/correction_count，按 window_start 升序
+    windows: list[PreviewWindowOut]
 
 
 class DeviceConfig(BaseModel):
@@ -1079,105 +1114,184 @@ def health() -> dict:
     return {"status": "ok"}
 
 
-@app.post("/ingest", response_model=IngestResponse)
-def ingest(req: IngestRequest) -> IngestResponse:
-    """按设备提交事件批次。批次内事件按提交顺序处理（与流式语义一致）。"""
-    now = utcnow_iso()
+def _run_ingest_batch(
+    conn: sqlite3.Connection, req: IngestRequest, now: str
+) -> tuple[list[EventResult], Optional[float], set[float]]:
+    """在给定事务连接上按请求顺序处理整批事件（/ingest 与 /ingest/preview 共用的唯一写入口径）。
+
+    逐事件推进幂等去重、窗口聚合、迟到修正、告警状态机与设备水位线，最后统一
+    封存越线窗口并对账设备所在组。返回 (逐事件结果, 处理后水位线, 本批次触及窗口起点集合)。
+    "触及窗口"指至少有一个非重复事件落入的窗口；预演接口据此回读预演后的窗口状态。
+    """
     results: list[EventResult] = []
+    touched_starts: set[float] = set()
 
-    # BEGIN IMMEDIATE：ingest 内含告警状态机的读-改-写（以及组汇总对账），
-    # 立即加写锁保证并发批次串行化，避免两个写事务基于同一状态快照而丢失状态变化。
-    with db.immediate_session() as conn:
-        dev = get_or_create_device(conn, req.device_id, now)
-        watermark = dev["watermark"]
-        size = dev["window_size_seconds"]
-        lateness = dev["allowed_lateness_seconds"]
-        # 批次开始后规则若被其他事务替换不会发生（写锁串行化）；
-        # 无规则的设备告警状态机不参与本批次处理。
-        alert_rule = get_alert_rule(conn, req.device_id)
+    dev = get_or_create_device(conn, req.device_id, now)
+    watermark = dev["watermark"]
+    size = dev["window_size_seconds"]
+    lateness = dev["allowed_lateness_seconds"]
+    # 批次开始后规则若被其他事务替换不会发生（写锁串行化）；
+    # 无规则的设备告警状态机不参与本批次处理。
+    alert_rule = get_alert_rule(conn, req.device_id)
 
-        for ev in req.events:
-            t = to_epoch(ev.event_time)
+    for ev in req.events:
+        t = to_epoch(ev.event_time)
 
-            # 幂等去重：同一 (device_id, event_id) 只生效一次
-            dup = conn.execute(
-                "SELECT 1 FROM events WHERE device_id = ? AND event_id = ?",
-                (req.device_id, ev.event_id),
-            ).fetchone()
-            if dup:
-                results.append(EventResult(event_id=ev.event_id, status="duplicate"))
-                continue
+        # 幂等去重：同一 (device_id, event_id) 只生效一次
+        dup = conn.execute(
+            "SELECT 1 FROM events WHERE device_id = ? AND event_id = ?",
+            (req.device_id, ev.event_id),
+        ).fetchone()
+        if dup:
+            results.append(EventResult(event_id=ev.event_id, status="duplicate"))
+            continue
 
-            w_start = window_floor(t, size)
-            w_end = w_start + size
-            # 所属窗口已封存（水位线已越过 window_end + 允许迟到窗口）=> 迟到数据
-            is_late = watermark is not None and watermark >= w_end + lateness
-            status = "late" if is_late else "accepted"
+        w_start = window_floor(t, size)
+        w_end = w_start + size
+        # 所属窗口已封存（水位线已越过 window_end + 允许迟到窗口）=> 迟到数据
+        is_late = watermark is not None and watermark >= w_end + lateness
+        status = "late" if is_late else "accepted"
 
+        conn.execute(
+            "INSERT INTO events (device_id, event_id, event_time, value, status, ingested_at)"
+            " VALUES (?, ?, ?, ?, ?, ?)",
+            (req.device_id, ev.event_id, t, ev.value, status, now),
+        )
+        conn.execute(
+            """
+            INSERT INTO windows (device_id, window_start, window_end, count, sum, min, max,
+                                 status, correction_count, late_event_count)
+            VALUES (?, ?, ?, 1, ?, ?, ?, 'open', ?, ?)
+            ON CONFLICT (device_id, window_start) DO UPDATE SET
+                count             = count + 1,
+                sum               = sum + excluded.sum,
+                min               = MIN(windows.min, excluded.min),
+                max               = MAX(windows.max, excluded.max),
+                correction_count  = correction_count + excluded.correction_count,
+                late_event_count  = late_event_count + excluded.late_event_count
+            """,
+            (
+                req.device_id, w_start, w_end, ev.value, ev.value, ev.value,
+                1 if is_late else 0,
+                1 if is_late else 0,
+            ),
+        )
+        touched_starts.add(w_start)
+        if is_late:
+            # 迟到数据落入已封存窗口：生成修正记录
             conn.execute(
-                "INSERT INTO events (device_id, event_id, event_time, value, status, ingested_at)"
+                "INSERT INTO corrections (device_id, event_id, window_start, event_time, value, created_at)"
                 " VALUES (?, ?, ?, ?, ?, ?)",
-                (req.device_id, ev.event_id, t, ev.value, status, now),
+                (req.device_id, ev.event_id, w_start, t, ev.value, now),
             )
-            conn.execute(
-                """
-                INSERT INTO windows (device_id, window_start, window_end, count, sum, min, max,
-                                     status, correction_count, late_event_count)
-                VALUES (?, ?, ?, 1, ?, ?, ?, 'open', ?, ?)
-                ON CONFLICT (device_id, window_start) DO UPDATE SET
-                    count             = count + 1,
-                    sum               = sum + excluded.sum,
-                    min               = MIN(windows.min, excluded.min),
-                    max               = MAX(windows.max, excluded.max),
-                    correction_count  = correction_count + excluded.correction_count,
-                    late_event_count  = late_event_count + excluded.late_event_count
-                """,
-                (
-                    req.device_id, w_start, w_end, ev.value, ev.value, ev.value,
-                    1 if is_late else 0,
-                    1 if is_late else 0,
-                ),
+
+        # 高值告警状态机：与聚合在同一事务内按事件值驱动（迟到事件同样参与，
+        # 因为重试的重复事件在上面的去重分支已 continue，故不会重复产生状态变化）
+        if alert_rule is not None:
+            apply_alert_state_machine(
+                conn, alert_rule, req.device_id, ev.event_id, t, ev.value, now
             )
-            if is_late:
-                # 迟到数据落入已封存窗口：生成修正记录
-                conn.execute(
-                    "INSERT INTO corrections (device_id, event_id, window_start, event_time, value, created_at)"
-                    " VALUES (?, ?, ?, ?, ?, ?)",
-                    (req.device_id, ev.event_id, w_start, t, ev.value, now),
-                )
 
-            # 高值告警状态机：与聚合在同一事务内按事件值驱动（迟到事件同样参与，
-            # 因为重试的重复事件在上面的去重分支已 continue，故不会重复产生状态变化）
-            if alert_rule is not None:
-                apply_alert_state_machine(
-                    conn, alert_rule, req.device_id, ev.event_id, t, ev.value, now
-                )
+        if watermark is None or t > watermark:
+            watermark = t
+        results.append(EventResult(event_id=ev.event_id, status=status, window_start=to_iso(w_start)))
 
-            if watermark is None or t > watermark:
-                watermark = t
-            results.append(EventResult(event_id=ev.event_id, status=status, window_start=to_iso(w_start)))
+    # 持久化水位线，并封存所有越过允许迟到窗口的窗口
+    conn.execute(
+        "UPDATE devices SET watermark = ? WHERE device_id = ?",
+        (watermark, req.device_id),
+    )
+    conn.execute(
+        "UPDATE windows SET status = 'sealed', sealed_at = ?"
+        " WHERE device_id = ? AND status = 'open' AND window_end + ? <= ?",
+        (now, req.device_id, lateness, watermark),
+    )
 
-        # 持久化水位线，并封存所有越过允许迟到窗口的窗口
-        conn.execute(
-            "UPDATE devices SET watermark = ? WHERE device_id = ?",
-            (watermark, req.device_id),
-        )
-        conn.execute(
-            "UPDATE windows SET status = 'sealed', sealed_at = ?"
-            " WHERE device_id = ? AND status = 'open' AND window_end + ? <= ?",
-            (now, req.device_id, lateness, watermark),
-        )
+    # 窗口封存 / 迟到修正后，同步重算该设备所在组的同步窗口汇总
+    reconcile_groups_for_device(conn, req.device_id, now)
 
-        # 窗口封存 / 迟到修正后，同步重算该设备所在组的同步窗口汇总
-        reconcile_groups_for_device(conn, req.device_id, now)
+    return results, watermark, touched_starts
 
+
+def _ingest_response(
+    device_id: str, results: list[EventResult], watermark: Optional[float]
+) -> IngestResponse:
     return IngestResponse(
-        device_id=req.device_id,
+        device_id=device_id,
         watermark=to_iso(watermark),
         accepted=sum(1 for r in results if r.status == "accepted"),
         duplicates=sum(1 for r in results if r.status == "duplicate"),
         late=sum(1 for r in results if r.status == "late"),
         results=results,
+    )
+
+
+@app.post("/ingest", response_model=IngestResponse)
+def ingest(req: IngestRequest) -> IngestResponse:
+    """按设备提交事件批次。批次内事件按提交顺序处理（与流式语义一致）。"""
+    now = utcnow_iso()
+
+    # BEGIN IMMEDIATE：ingest 内含告警状态机的读-改-写（以及组汇总对账），
+    # 立即加写锁保证并发批次串行化，避免两个写事务基于同一状态快照而丢失状态变化。
+    with db.immediate_session() as conn:
+        results, watermark, _ = _run_ingest_batch(conn, req, now)
+
+    return _ingest_response(req.device_id, results, watermark)
+
+
+@app.post("/ingest/preview", response_model=IngestPreviewResponse)
+def ingest_preview(req: IngestRequest) -> IngestPreviewResponse:
+    """预演一次与 POST /ingest 同口径的批次提交（只读语义，绝不留下写入）。
+
+    接收与 POST /ingest 完全相同的设备与事件批次，在**同一数据库快照**上按请求顺序
+    推进去重、水位线、窗口封存、迟到修正、告警状态机与组汇总对账，返回：
+    - 逐事件预计状态 accepted/duplicate/late（批内重复 event_id 只计一次；前一事件
+      抬高水位线后，后一旧事件可能因此变成 late）；
+    - 预演后的预计水位线；
+    - 本批次触及窗口（至少落入一个非重复事件）预演后的 count、sum、status、
+      correction_count，按 window_start 升序。
+    结果口径与随即在无并发写入时提交同一批次完全一致。整个预演在 BEGIN IMMEDIATE
+    事务内完成并**一律回滚**：设备（含不存在设备的自动注册）、事件、窗口、修正、
+    告警状态/流水及组汇总/审计快照均不留痕。
+    """
+    now = utcnow_iso()
+
+    # rollback_session 与提交路径同样立即加写锁：预演期间无其他写事务能插入，
+    # 逐事件判断基于的快照稳定；结束后全部写入随回滚撤销。
+    with db.rollback_session() as conn:
+        results, watermark, touched_starts = _run_ingest_batch(conn, req, now)
+
+        windows: list[PreviewWindowOut] = []
+        if touched_starts:
+            starts_sql = placeholders(len(touched_starts))
+            rows = conn.execute(
+                f"SELECT * FROM windows WHERE device_id = ?"
+                f" AND window_start IN ({starts_sql}) ORDER BY window_start",
+                [req.device_id, *sorted(touched_starts)],
+            ).fetchall()
+            windows = [
+                PreviewWindowOut(
+                    window_start=to_iso(r["window_start"]),
+                    window_end=to_iso(r["window_end"]),
+                    status=r["status"],
+                    count=r["count"],
+                    sum=r["sum"],
+                    correction_count=r["correction_count"],
+                )
+                for r in rows
+            ]
+
+    accepted = sum(1 for r in results if r.status == "accepted")
+    duplicates = sum(1 for r in results if r.status == "duplicate")
+    late = sum(1 for r in results if r.status == "late")
+    return IngestPreviewResponse(
+        device_id=req.device_id,
+        watermark=to_iso(watermark),
+        accepted=accepted,
+        duplicates=duplicates,
+        late=late,
+        results=results,
+        windows=windows,
     )
 
 

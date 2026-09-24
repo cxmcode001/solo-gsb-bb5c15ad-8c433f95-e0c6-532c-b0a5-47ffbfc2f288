@@ -254,6 +254,26 @@ def session() -> Iterator[sqlite3.Connection]:
 
 
 @contextmanager
+def rollback_session() -> Iterator[sqlite3.Connection]:
+    """预演（dry-run）会话：进入即 BEGIN IMMEDIATE，退出时**一律 ROLLBACK**。
+
+    与 immediate_session 一样立即加写锁：预演期间读取的快照不会被其他写事务改变，
+    逐事件推进的去重/水位线/封存判断与随即在无并发写入时真正提交完全一致；
+    预演结束（或处理中抛异常）后所有写入随回滚撤销，设备、事件、窗口、修正、
+    告警状态/流水及组汇总均不留痕。
+    """
+    conn = connect()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            yield conn
+        finally:
+            conn.rollback()
+    finally:
+        conn.close()
+
+
+@contextmanager
 def immediate_session() -> Iterator[sqlite3.Connection]:
     """立即加写锁的事务会话：进入即 BEGIN IMMEDIATE，正常退出提交，异常回滚。
 

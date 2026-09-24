@@ -1,6 +1,6 @@
 # 传感器遥测汇聚 API
 
-基于 **FastAPI + SQLite** 的传感器遥测汇聚服务，支持事件时间水位线、允许迟到窗口、幂等去重与迟到数据修正，提供**设备可版本化标签**（全量替换、键名规范化、乐观并发 `if_version`、按当前标签筛选设备），并提供**设备组同步窗口汇总**（固定成员组，sum/avg，全成员封存才出数，迟到修正原位升版）、**组窗口修订审计**（首次 ready 与每次升版在同事务追加不可变快照，提供修订列表与两版本 diff）、**封存窗口稳健异常检测**（对已封存窗口事件按中位数/MAD 打稳健分数，纯只读）、**跨设备窗口检索**（按时间范围、状态与设备标签精确筛选，绑定筛选条件的稳定游标分页）、**设备级高值告警**（触发/恢复双阈值滞回状态机，事件写入驱动状态转换，规则与状态持久化，批次重试不重复产生状态变化）、**设备告警周期查询**（按转换流水自增顺序配对 entered/cleared 成周期，以流水处理时刻为起止，裁剪到指定 UTC 区间给出各周期秒数与总告警秒数，未解除周期计至 end 与查询时刻较早者，纯只读）、**设备缺报区间查询**（按窗口空隙计算连续缺报段，水位线未越过封存条件的窗口不报缺，迟到填空后自动缩短/拆分，纯只读）与**设备每日同窗基线偏移查询**（按 UTC 每天同一窗位回看已封存窗口，以窗口均值的中位数/MAD 计算目标窗口偏移分数，缺失或未封存样本不以临近窗口代替，样本不足明确返回，迟到修正后再次查询反映最新聚合，纯只读）。
+基于 **FastAPI + SQLite** 的传感器遥测汇聚服务，支持事件时间水位线、允许迟到窗口、幂等去重与迟到数据修正，并提供**提交预演**（`POST /ingest/preview` 与正式提交同口径，在同一快照上按请求顺序推进去重/水位线/封存，逐事件给出 accepted/duplicate/late 与触及窗口预演聚合，事务一律回滚不留写入），提供**设备可版本化标签**（全量替换、键名规范化、乐观并发 `if_version`、按当前标签筛选设备），并提供**设备组同步窗口汇总**（固定成员组，sum/avg，全成员封存才出数，迟到修正原位升版）、**组窗口修订审计**（首次 ready 与每次升版在同事务追加不可变快照，提供修订列表与两版本 diff）、**封存窗口稳健异常检测**（对已封存窗口事件按中位数/MAD 打稳健分数，纯只读）、**跨设备窗口检索**（按时间范围、状态与设备标签精确筛选，绑定筛选条件的稳定游标分页）、**设备级高值告警**（触发/恢复双阈值滞回状态机，事件写入驱动状态转换，规则与状态持久化，批次重试不重复产生状态变化）、**设备告警周期查询**（按转换流水自增顺序配对 entered/cleared 成周期，以流水处理时刻为起止，裁剪到指定 UTC 区间给出各周期秒数与总告警秒数，未解除周期计至 end 与查询时刻较早者，纯只读）、**设备缺报区间查询**（按窗口空隙计算连续缺报段，水位线未越过封存条件的窗口不报缺，迟到填空后自动缩短/拆分，纯只读）与**设备每日同窗基线偏移查询**（按 UTC 每天同一窗位回看已封存窗口，以窗口均值的中位数/MAD 计算目标窗口偏移分数，缺失或未封存样本不以临近窗口代替，样本不足明确返回，迟到修正后再次查询反映最新聚合，纯只读）。
 
 ## 核心语义
 
@@ -10,6 +10,14 @@
 - **幂等去重**：同一 `(device_id, event_id)` 重复提交只生效一次，返回 `duplicate`，不影响聚合结果。
 - **迟到修正**：窗口封存后到达的事件标记为 `late`，仍计入窗口聚合，同时生成一条修正记录（correction），窗口的 `correction_count` 递增。
 - 批次内事件按提交顺序处理，与流式处理语义一致。
+
+### 提交预演（POST /ingest/preview，dry-run）
+
+- **同口径预演**：`POST /ingest/preview` 接收与 `POST /ingest` **完全相同**的设备与事件批次（请求体与校验规则一致），在**同一数据库快照**（`BEGIN IMMEDIATE` 写锁事务，预演期间无其他写者插入）上按请求顺序推进去重、水位线、窗口封存、迟到修正、告警状态机与组汇总对账，复用与正式提交**同一份处理逻辑**，不存在两套判断漂移。
+- **逐事件预计结果**：返回每个事件预计的 `accepted`/`duplicate`/`late`、预计 `watermark` 与计数汇总。**批内重复事件只计一次**（同一 `event_id` 第二次出现即 `duplicate`，即使库中原本不存在）；**前一事件抬高水位线后，后一旧事件可能因此变成 `late`**——结果与批次顺序强相关。
+- **触及窗口预演聚合**：`windows` 给出本批次**触及窗口**（至少有一个非重复事件落入的窗口）在预演后的 `window_start`/`window_end`、`count`、`sum`、`status`（open/sealed）与 `correction_count`，按 `window_start` 升序；纯重复批次该列表为空。
+- **结果等价于随即提交**：预演返回的口径与**随即在无并发写入时**用 `POST /ingest` 提交同一批次完全一致（逐事件状态、水位线、窗口状态与聚合、修正计数、组汇总均一致）。
+- **绝不留下写入**：整个预演在可回滚事务中完成，结束时**一律 ROLLBACK**——设备（含不存在设备的自动注册、水位线）、事件、窗口、修正记录、告警状态与转换流水、组汇总及不可变修订审计快照都不会落盘；可重复调用、结果稳定。
 
 ### 设备可版本化标签
 
@@ -244,7 +252,55 @@ curl -X POST http://localhost:8000/ingest \
 }
 ```
 
-### 4. 查询窗口聚合
+### 4. 预演批次提交（POST /ingest/preview，不落库）
+
+沿用上面的状态：`sensor-001` 的窗口 `[10:00,10:01)` 已封存、水位线在 `10:02:00`。预演一批**尚未提交**的事件——`evt-1` 库中已存在（duplicate），`evt-4p` 落入已封存窗口（late），`evt-5` 先把水位线抬到 `10:03:00`，随后的 `evt-6` 虽然事件时间较旧、但其窗口 `[10:02,10:03)` 尚未达到封存条件（`10:03:00 + 30s > 10:03:00`），仍为 accepted：
+
+```bash
+curl -X POST http://localhost:8000/ingest/preview \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "device_id": "sensor-001",
+    "events": [
+      {"event_id": "evt-1",  "event_time": "2026-09-22T10:00:10Z", "value": 21.5},
+      {"event_id": "evt-4p", "event_time": "2026-09-22T10:00:20Z", "value": 18.0},
+      {"event_id": "evt-5",  "event_time": "2026-09-22T10:03:00Z", "value": 24.0},
+      {"event_id": "evt-6",  "event_time": "2026-09-22T10:02:20Z", "value": 22.5},
+      {"event_id": "evt-4p", "event_time": "2026-09-22T10:00:20Z", "value": 18.0}
+    ]
+  }'
+```
+
+响应给出逐事件预计状态、预计水位线，以及本批次触及窗口预演后的 count/sum/status/correction_count（注意第二个 `evt-4p` 是**批内重复**，只计一次；若把 `evt-5` 的时间再往后放到 `10:03:30` 及以后，`evt-6` 在批内就会因水位线被抬高而变成 `late`）：
+
+```json
+{
+  "device_id": "sensor-001",
+  "watermark": "2026-09-22T10:03:00Z",
+  "accepted": 2, "duplicates": 2, "late": 1,
+  "results": [
+    {"event_id": "evt-1",  "status": "duplicate", "window_start": null},
+    {"event_id": "evt-4p", "status": "late",      "window_start": "2026-09-22T10:00:00Z"},
+    {"event_id": "evt-5",  "status": "accepted",  "window_start": "2026-09-22T10:03:00Z"},
+    {"event_id": "evt-6",  "status": "accepted",  "window_start": "2026-09-22T10:02:00Z"},
+    {"event_id": "evt-4p", "status": "duplicate", "window_start": null}
+  ],
+  "windows": [
+    {"window_start": "2026-09-22T10:00:00Z", "window_end": "2026-09-22T10:01:00Z",
+     "status": "sealed", "count": 4, "sum": 82.4, "correction_count": 2},
+    {"window_start": "2026-09-22T10:02:00Z", "window_end": "2026-09-22T10:03:00Z",
+     "status": "open", "count": 2, "sum": 45.6, "correction_count": 0},
+    {"window_start": "2026-09-22T10:03:00Z", "window_end": "2026-09-22T10:04:00Z",
+     "status": "open", "count": 1, "sum": 24.0, "correction_count": 0}
+  ]
+}
+```
+
+> 上面 `10:00` 窗口的 `count=4/sum=82.4/correction_count=2` 是在第 3 步既有状态（含 `evt-4` 的一次迟到修正）上叠加本次预演的结果；`10:02` 窗口因此前已有 `evt-3`（23.1）故为 2 条。
+>
+> 预演**不会写入任何数据**：再次 `GET /devices/sensor-001` 水位线仍是 `10:02:00`、事件数与窗口聚合不变、修正记录不增加；对不存在的设备预演也不会自动注册该设备。预演结果与随即在无并发写入时 `POST /ingest` 同一批次的提交结果完全一致，可安全重复调用。请求体格式、字段约束与校验（空批次 `422` 等）与 `POST /ingest` 完全相同。
+
+### 5. 查询窗口聚合
 
 ```bash
 curl http://localhost:8000/devices/sensor-001/windows
@@ -276,7 +332,7 @@ curl http://localhost:8000/devices/sensor-001/windows
 ]
 ```
 
-### 5. 查询修正记录
+### 6. 查询修正记录
 
 ```bash
 curl http://localhost:8000/devices/sensor-001/corrections
@@ -296,7 +352,7 @@ curl http://localhost:8000/devices/sensor-001/corrections
 ]
 ```
 
-### 6. 查询设备水位线
+### 7. 查询设备水位线
 
 ```bash
 curl http://localhost:8000/devices/sensor-001
@@ -315,7 +371,7 @@ curl http://localhost:8000/devices/sensor-001
 }
 ```
 
-### 7. 写入设备标签（版本化、全量替换）
+### 8. 写入设备标签（版本化、全量替换）
 
 ```bash
 curl -X PUT http://localhost:8000/devices/sensor-001/labels \
@@ -353,7 +409,7 @@ curl -X PUT http://localhost:8000/devices/sensor-001/labels \
 # 若设备当前已是 version 2 => 409 {"detail": "label version conflict: if_version=1 does not match current version 2"}
 ```
 
-### 8. 读取当前标签与版本
+### 9. 读取当前标签与版本
 
 ```bash
 curl http://localhost:8000/devices/sensor-001/labels
@@ -370,7 +426,7 @@ curl http://localhost:8000/devices/sensor-001/labels
 
 从未写入过标签的设备返回 `version: 0`、空标签。
 
-### 9. 按当前标签筛选设备
+### 10. 按当前标签筛选设备
 
 ```bash
 # 精确匹配某个键值对
@@ -385,7 +441,7 @@ curl http://localhost:8000/devices
 
 只给 `label_value` 不给 `label_key` 返回 `422`。响应为设备对象列表（结构同 `GET /devices/{id}`），按 `device_id` 升序。
 
-### 10. 创建设备组（固定成员，sum/avg）
+### 11. 创建设备组（固定成员，sum/avg）
 
 成员设备必须**先存在**且窗口配置与组一致（可先用第 1 步的 config 接口或上报事件完成注册）：
 
@@ -404,7 +460,7 @@ curl -X POST http://localhost:8000/groups \
 - 成员不存在 → `404`；窗口配置不一致或组 ID 已存在 → `409`；成员列表重复 → `400`。
 - 组创建后即对成员已有窗口做一次补算。
 
-### 11. 按窗口查询组汇总
+### 12. 按窗口查询组汇总
 
 ```bash
 # 全部窗口（pending + ready）
@@ -440,7 +496,7 @@ curl http://localhost:8000/groups/floor-1/windows/2026-09-22T10:00:00Z
 
 全部封存后：`status` 变为 `ready`，`revision` 从 1 起。此后任一成员窗口收到迟到事件，该记录原位重算、`revision` 递增；同一 `event_id` 重试不升版。
 
-### 12. 查询 pending 成员明细
+### 13. 查询 pending 成员明细
 
 ```bash
 curl http://localhost:8000/groups/floor-1/windows/2026-09-22T10:00:00Z/pending
@@ -460,7 +516,7 @@ curl http://localhost:8000/groups/floor-1/windows/2026-09-22T10:00:00Z/pending
 ]
 ```
 
-### 13. 查询组窗口修订列表（不可变快照）
+### 14. 查询组窗口修订列表（不可变快照）
 
 组窗口每次首次 ready、以及迟到修正升版时，都会在同一事务留一份不可变快照：
 
@@ -479,7 +535,7 @@ curl http://localhost:8000/groups/floor-1/windows/2026-09-22T10:00:00Z/revisions
 - 旧版本数据库升级后首次启动，只会为已 ready 窗口补一份**当前 revision** 的 `baseline`，不伪造早期版本。
 - 快照只追加、不可修改：任何对审计表的 `UPDATE`/`DELETE` 都会被数据库触发器中止；同一 revision 重复上报也受唯一约束保护，不会重复留档。
 
-### 14. 对比两个 revision（diff）
+### 15. 对比两个 revision（diff）
 
 ```bash
 curl 'http://localhost:8000/groups/floor-1/windows/2026-09-22T10:00:00Z/revisions/diff?from_revision=1&to_revision=2'
@@ -516,7 +572,7 @@ curl 'http://localhost:8000/groups/floor-1/windows/2026-09-22T10:00:00Z/revision
 - `from_revision` / `to_revision` 均必填且 `>= 1`，且 `from_revision < to_revision`，否则返回 `422`。
 - 组、窗口不存在，或指定的任一 revision 无快照（例如 baseline 之前被伪造的旧版本号）返回 `404`。
 
-### 15. 封存窗口稳健异常检测（中位数 / MAD）
+### 16. 封存窗口稳健异常检测（中位数 / MAD）
 
 窗口必须**已封存**；检测范围包含迟到事件，接口纯只读。下例窗口 `[10:00, 10:01)` 已封存，其中大部分值贴近 21.5，`evt-spike` 为离群点：
 
@@ -541,7 +597,7 @@ curl 'http://localhost:8000/devices/sensor-001/anomalies?window_start=2026-09-22
 - 当窗口 MAD 为 0（过半事件等于中位数）时，所有不等于中位数的事件均判为异常，其 `score` 为 `null`。
 - 设备不存在或窗口不存在返回 `404`；窗口尚未封存（`open`）返回 `409`；`threshold <= 0` 返回 `422`。
 
-### 16. 跨设备窗口检索（游标分页）
+### 17. 跨设备窗口检索（游标分页）
 
 按窗口时间范围、状态与设备当前标签跨设备检索，结果按 `window_start`、`device_id` 升序：
 
@@ -590,7 +646,7 @@ curl 'http://localhost:8000/windows/search?status=sealed&limit=100&cursor=eyJ2Ij
 - 翻页期间新增的窗口不会进入本次遍历（既不重复也不遗漏）；要看新增数据，不带 `cursor` 重新检索即可。
 - 游标非法、被篡改、过期（默认 1 小时）或与当前筛选条件不一致返回 `400`；`end <= start`、只给 `label_value`、`limit` 越界返回 `422`。
 
-### 17. 设备级高值告警（触发/恢复双阈值）
+### 18. 设备级高值告警（触发/恢复双阈值）
 
 先设置规则（触发线 80、恢复线 70；设备须已注册，可先上报一个事件或调用 config 接口）：
 
@@ -643,7 +699,7 @@ curl http://localhost:8000/devices/sensor-001/alert
 - 告警中再次上报 `>= 80` 的值不会重复增加 `alarm_count`；只有先解除（`<= 70`）后再次越线才开始下一轮。
 - 对未配置规则的设备调用 `GET /devices/{id}/alert` 返回 `404`；同一事件批次重试只会得到 `duplicate`，`alarm_count`/`recovery_count` 与转换流水均不变；规则与状态在服务重启后原样保留。
 
-### 18. 查询设备缺报区间
+### 19. 查询设备缺报区间
 
 假设 `sensor-001` 在 `10:00`、`10:03`、`10:04` 有窗口记录，水位线已推进到 `10:04:00`（窗口 60s、允许迟到 30s，封存条件覆盖到窗口起点 `10:02`），则 `10:01`、`10:02` 两个空窗构成一段缺报：
 
@@ -661,7 +717,7 @@ curl 'http://localhost:8000/devices/sensor-001/missing-windows?start=2026-09-22T
 - 只统计设备最早有数据窗口的**下一个窗口**起、且水位线已越过封存条件的空窗；未封存窗口不报缺。
 - 迟到事件首次填入空窗后，再次查询会自动缩短或拆分缺报段（上例若 `10:02` 被迟到事件填入，则该段缩短为 `[10:01, 10:02)` 一段）；接口纯只读，不改动任何聚合。
 
-### 19. 每日同窗基线偏移查询
+### 20. 每日同窗基线偏移查询
 
 假设 `sensor-001` 在 **2026-09-17～21 日每天 08:00** 的 1 分钟窗口均值分别为 `10,11,12,13,14`，目标窗口为 **2026-09-22 08:00**（已封存），均值 `20`：
 
@@ -701,7 +757,7 @@ curl 'http://localhost:8000/devices/sensor-001/daily-baseline?window_start=2026-
 - 目标窗口的迟到修正会原位更新其均值，**再次查询立即反映最新聚合与判定**。
 - `days` 仅允许 `3..30`、`threshold` 必须 `> 0`，否则 `422`；窗口秒数不能整除一天返回 `422`；设备/目标窗口不存在返回 `404`，目标窗口未封存返回 `409`。
 
-### 20. 查询设备告警周期与总告警秒数
+### 21. 查询设备告警周期与总告警秒数
 
 假设 `sensor-001` 已配置告警规则，且告警转换流水为：**09:00:05** 进入告警、**09:03:05** 解除（均为流水处理时刻 `created_at`）。查询 `[09:01:00, 10:00:00)` 时，该周期被裁剪为 `[09:01:00, 09:03:05)`，计 **125** 秒：
 
@@ -732,6 +788,7 @@ curl 'http://localhost:8000/devices/sensor-001/alert-episodes?start=2026-09-23T0
 | --- | --- | --- |
 | `GET` | `/health` | 健康检查 |
 | `POST` | `/ingest` | 按设备提交事件批次（幂等） |
+| `POST` | `/ingest/preview` | 预演批次提交（dry-run；与 /ingest 同请求体与判断口径，返回逐事件 accepted/duplicate/late、预计水位线及触及窗口预演后的 count/sum/status/correction_count；同快照按序推进，事务一律回滚不留任何写入） |
 | `PUT` | `/devices/{device_id}/config` | 创建/更新设备窗口与允许迟到配置 |
 | `GET` | `/devices` | 设备列表，支持 `?label_key=&label_value=` 按当前标签筛选 |
 | `GET` | `/devices/{device_id}` | 设备水位线与统计 |
@@ -758,10 +815,11 @@ curl 'http://localhost:8000/devices/sensor-001/alert-episodes?start=2026-09-23T0
 
 ```
 app/
-  main.py        # FastAPI 应用、遥测聚合、设备标签（版本化/乐观并发）、设备组同步窗口汇总与修订审计快照、跨设备窗口检索（稳定游标分页）、设备级高值告警（双阈值滞回状态机）、告警周期查询（流水配对/区间裁剪/总秒数）、设备缺报区间查询、每日同窗基线偏移查询逻辑
-  db.py          # SQLite 连接、建表（含标签表、append-only 审计表/触发器、告警规则/状态/转换流水表）、旧库迁移与事务会话
+  main.py        # FastAPI 应用、遥测聚合、提交预演（/ingest 与 /ingest/preview 共用同一批次处理逻辑、预演事务回滚）、设备标签（版本化/乐观并发）、设备组同步窗口汇总与修订审计快照、跨设备窗口检索（稳定游标分页）、设备级高值告警（双阈值滞回状态机）、告警周期查询（流水配对/区间裁剪/总秒数）、设备缺报区间查询、每日同窗基线偏移查询逻辑
+  db.py          # SQLite 连接、建表（含标签表、append-only 审计表/触发器、告警规则/状态/转换流水表）、旧库迁移与事务会话（提交 / 立即写锁 / 预演回滚）
 tests/
   test_api.py       # 端到端测试（水位线/封存/去重/迟到修正/持久化）
+  test_ingest_preview.py # 提交预演测试（与随即提交同口径、批内重复只计一次、批内水位线致 late、设备/事件/窗口/修正/告警/组汇总/审计快照回滚无痕、重复预演稳定、请求校验）
   test_labels.py    # 设备标签测试（规范化/重复键/版本递增/乐观并发/标签筛选/旧库迁移）
   test_groups.py    # 设备组测试（pending/ready、修正升版、重试幂等、成员明细）
   test_revisions.py # 修订审计测试（快照留档、diff、422/404、不可变性、旧库 baseline 补档）
